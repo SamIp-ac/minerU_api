@@ -1,0 +1,17 @@
+services:
+  mineru-api:
+    build:
+      context: .
+      dockerfile: dockerfile
+    image: samipdocker/mineru-api:latest
+    container_name: mineru-container
+    ports:
+      - "8087:8087"
+    volumes:
+      - mineru_models:/app/.cache
+    environment:
+      MINERU_MAX_CONCURRENT_TASKS: "2"
+    restart: unless-stopped
+
+volumes:
+  mineru_models:

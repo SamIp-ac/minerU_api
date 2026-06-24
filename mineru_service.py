@@ -1,44 +1,103 @@
 # mineru_service.py
-import os
-import io
+import asyncio
+import concurrent.futures
+import copy
 import json
+import os
 import tempfile
 from pathlib import Path
 from typing import Optional
 
-# --- FastAPI and other Imports ---
 import uvicorn
 from fastapi import FastAPI, UploadFile, File, HTTPException, Query, Response
 from loguru import logger
 
-# --- MinerU Imports: This section strictly follows the provided main.py ---
-import copy
-
-# CRITICAL FIX: Import 'read_fn' exactly as in main.py. This is the key.
-from mineru.cli.common import convert_pdf_bytes_to_bytes_by_pypdfium2, prepare_env, read_fn
+from mineru.backend.pipeline.model_json_to_middle_json import result_to_middle_json as pipeline_result_to_middle_json
+from mineru.backend.pipeline.pipeline_middle_json_mkcontent import union_make as pipeline_union_make
+from mineru.cli.common import convert_pdf_bytes_to_bytes, prepare_env
 from mineru.data.data_reader_writer import FileBasedDataWriter
 from mineru.utils.enum_class import MakeMode
-from mineru.backend.pipeline.pipeline_analyze import doc_analyze as pipeline_doc_analyze
-from mineru.backend.pipeline.pipeline_middle_json_mkcontent import union_make as pipeline_union_make
-from mineru.backend.pipeline.model_json_to_middle_json import result_to_middle_json as pipeline_result_to_middle_json
 
+from input_utils import ALLOWED_SUFFIXES, PDF_RENDER_DPI, IMAGE_WRAPPED_PDF_DPI, NATIVE_MAX_SIDE, read_input_file
+from legacy_pipeline import doc_analyze as pipeline_doc_analyze_v2
+from modern_pipeline import do_parse_v3
 
-# --- FastAPI App Definition ---
-app = FastAPI(
-    title="MinerU Document Analysis Service (Strictly following main.py logic)",
-    description="A service dedicated to running the AGPL-licensed MinerU library, strictly adhering to the file processing logic of the original main.py script.",
-    version="1.3.0",
+convert_pdf_bytes_to_bytes_by_pypdfium2 = convert_pdf_bytes_to_bytes
+
+NATIVE_RESOLUTION_NOTE = (
+    "Native-resolution mode is enabled for both v2 and v3 routes. "
+    "Image uploads (png/jpg/jpeg) are wrapped into PDF without MinerU's 200 DPI save step, "
+    f"then rendered at {IMAGE_WRAPPED_PDF_DPI} DPI with no 3500px long-side cap. "
+    f"PDF uploads render at {PDF_RENDER_DPI} DPI with no 3500px cap (default MinerU cap bypassed via max_side={NATIVE_MAX_SIDE}). "
+    "Internal ML models may still resize tensors during inference."
 )
 
-# Define the set of allowed file extensions from main.py
-ALLOWED_EXTENSIONS = {".pdf", ".png", ".jpeg", ".jpg"}
+PIPELINE_V2_NOTE = (
+    "MinerU 2.0.6-compatible pipeline on top of mineru 3.2.x libraries: "
+    "doc_analyze (batch) -> result_to_middle_json -> union_make."
+)
+
+PIPELINE_V3_NOTE = (
+    "MinerU 3.2.1 default pipeline: doc_analyze_streaming (processing-window) -> union_make. "
+    "Different orchestration and post-processing from v2; output schema is similar but not identical."
+)
+
+MAX_CONCURRENT_TASKS = max(1, int(os.getenv("MINERU_MAX_CONCURRENT_TASKS", "2")))
+_analysis_semaphore = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
+_active_tasks = 0
+_active_tasks_lock = asyncio.Lock()
+_thread_pool: concurrent.futures.ThreadPoolExecutor | None = None
+
+CONCURRENCY_NOTE = (
+    f"Parallel requests are supported up to {MAX_CONCURRENT_TASKS} concurrent analysis tasks "
+    f"(MINERU_MAX_CONCURRENT_TASKS). Additional requests wait in queue. "
+    "Heavy ML inference runs in worker threads so the API can accept multiple uploads at once."
+)
+
+LANG_QUERY_DESCRIPTION = (
+    "Optional OCR language hint for the entire document (not per region/block). "
+    "Omit this parameter, or send an empty value (`lang=`), for multilingual or mixed-language pages; "
+    "MinerU will use its default OCR path without a language-specific model hint. "
+    "Set a value only when the document is mostly one language and you want to bias OCR accuracy "
+    "(e.g. ch, en, korean, japan, ch_server, arabic, devanagari)."
+)
+
+app = FastAPI(
+    title="MinerU Document Analysis Service",
+    description=(
+        "Layout analysis API with two pipeline versions for comparison. "
+        + NATIVE_RESOLUTION_NOTE
+        + " "
+        + CONCURRENCY_NOTE
+    ),
+    version="1.5.0",
+)
+
+ALLOWED_EXTENSIONS = ALLOWED_SUFFIXES
 
 
-def do_parse_in_api(
+def normalize_lang(lang: Optional[str]) -> Optional[str]:
+    if lang is None:
+        return None
+    normalized = lang.strip()
+    return normalized or None
+
+
+def _validate_extension(filename: str) -> None:
+    file_extension = Path(filename).suffix.lower()
+    if file_extension not in ALLOWED_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"File type '{file_extension}' not supported. Please upload one of: {sorted(ALLOWED_EXTENSIONS)}",
+        )
+
+
+def do_parse_v2(
     output_dir: str,
     pdf_file_names: list[str],
     pdf_bytes_list: list[bytes],
-    p_lang_list: list[str],
+    is_image_source_list: list[bool],
+    p_lang_list: list[Optional[str]],
     parse_method: str,
     start_page_id: int,
     end_page_id: Optional[int],
@@ -46,113 +105,284 @@ def do_parse_in_api(
     p_table_enable: bool = True,
     f_make_md_mode: MakeMode = MakeMode.MM_MD,
 ):
-    """
-    This function is a direct adaptation of `do_parse` from main.py,
-    modified to return data instead of writing all files.
-    """
-    # --- Start: Code directly from main.py's do_parse ---
     for idx, pdf_bytes in enumerate(pdf_bytes_list):
-        new_pdf_bytes = convert_pdf_bytes_to_bytes_by_pypdfium2(pdf_bytes, start_page_id, end_page_id)
-        pdf_bytes_list[idx] = new_pdf_bytes
+        pdf_bytes_list[idx] = convert_pdf_bytes_to_bytes_by_pypdfium2(
+            pdf_bytes, start_page_id, end_page_id
+        )
 
-    infer_results, all_image_lists, all_pdf_docs, lang_list, ocr_enabled_list = pipeline_doc_analyze(
-        pdf_bytes_list, p_lang_list, parse_method=parse_method, formula_enable=p_formula_enable, table_enable=p_table_enable
+    infer_results, all_image_lists, all_pdf_docs, lang_list, ocr_enabled_list = pipeline_doc_analyze_v2(
+        pdf_bytes_list,
+        p_lang_list,
+        is_image_source_list,
+        parse_method=parse_method,
+        formula_enable=p_formula_enable,
+        table_enable=p_table_enable,
+        start_page_id=0,
+        end_page_id=None,
     )
 
-    # This loop will run once in the API context
     for idx, model_list in enumerate(infer_results):
         model_json = copy.deepcopy(model_list)
         pdf_file_name = pdf_file_names[idx]
-        local_image_dir, local_md_dir = prepare_env(output_dir, pdf_file_name, parse_method)
+        local_image_dir, _local_md_dir = prepare_env(output_dir, pdf_file_name, parse_method)
         image_writer = FileBasedDataWriter(local_image_dir)
 
         images_list = all_image_lists[idx]
         pdf_doc = all_pdf_docs[idx]
-        _lang = lang_list[idx]
-        _ocr_enable = ocr_enabled_list[idx]
+        lang = lang_list[idx]
+        ocr_enable = ocr_enabled_list[idx]
 
-        middle_json = pipeline_result_to_middle_json(model_list, images_list, pdf_doc, image_writer, _lang, _ocr_enable, p_formula_enable)
+        middle_json = pipeline_result_to_middle_json(
+            model_list,
+            images_list,
+            pdf_doc,
+            image_writer,
+            lang,
+            ocr_enable,
+            p_formula_enable,
+        )
         pdf_info = middle_json["pdf_info"]
-        
         image_dir = str(os.path.basename(local_image_dir))
         md_content_str = pipeline_union_make(pdf_info, f_make_md_mode, image_dir)
         content_list = pipeline_union_make(pdf_info, MakeMode.CONTENT_LIST, image_dir)
-    # --- End: Code directly from main.py's do_parse ---
 
-        logger.info(f"MinerU analysis complete for {pdf_file_name}")
-        
-        # Return the data required by the API
+        logger.info(f"MinerU v2 analysis complete for {pdf_file_name}")
         return {
             "middle_json": middle_json,
             "model_json": model_json,
             "content_list_json": content_list,
-            "markdown": md_content_str
+            "markdown": md_content_str,
+            "pipeline": "v2_legacy_doc_analyze",
+            "rendered_pages": [
+                {"page_index": page_idx, "width": img["img_pil"].width, "height": img["img_pil"].height}
+                for page_idx, img in enumerate(images_list)
+            ],
         }
 
-    raise RuntimeError("MinerU analysis failed to produce any output.")
+    raise RuntimeError("MinerU v2 analysis failed to produce any output.")
 
 
-@app.post("/analyze_layout/", summary="Analyze document layout following main.py logic")
-async def analyze_document(
-    file: UploadFile = File(..., description=f"The document to analyze. Supported types: {list(ALLOWED_EXTENSIONS)}"),
-    lang: str = Query("en", description="Document language ('ch', 'en', 'korean', 'japan', etc.)"),
-    parse_method: str = Query("auto", description="Parsing method: 'auto', 'txt', or 'ocr'"),
-    start_page_id: int = Query(0, description="The starting page for analysis (0-indexed)."),
-    end_page_id: Optional[int] = Query(None, description="The ending page for analysis. 'None' means to the end.")
+def _run_analysis_sync(
+    *,
+    temp_dir: str,
+    filename: str,
+    pdf_bytes: bytes,
+    is_image_source: bool,
+    lang: Optional[str],
+    parse_method: str,
+    start_page_id: int,
+    end_page_id: Optional[int],
+    pipeline_version: str,
 ):
-    """
-    Accepts a document (PDF or Image) and returns its detailed layout analysis as JSON.
-    This endpoint strictly follows the processing pipeline defined in the reference `main.py` script.
-    """
-    file_extension = Path(file.filename).suffix.lower()
-    if file_extension not in ALLOWED_EXTENSIONS:
-        raise HTTPException(
-            status_code=400,
-            detail=f"File type '{file_extension}' not supported. Please upload one of: {list(ALLOWED_EXTENSIONS)}"
+    file_name_list = [Path(filename).stem]
+    pdf_bytes_list = [pdf_bytes]
+    is_image_source_list = [is_image_source]
+    lang_list = [lang]
+
+    if pipeline_version == "v2":
+        return do_parse_v2(
+            output_dir=temp_dir,
+            pdf_file_names=file_name_list,
+            pdf_bytes_list=pdf_bytes_list,
+            is_image_source_list=is_image_source_list,
+            p_lang_list=lang_list,
+            parse_method=parse_method,
+            start_page_id=start_page_id,
+            end_page_id=end_page_id,
         )
 
-    with tempfile.TemporaryDirectory() as temp_dir:
-        # `read_fn` requires a file path, so we must save the uploaded file temporarily.
+    if pipeline_version == "v3":
+        trimmed_bytes = convert_pdf_bytes_to_bytes_by_pypdfium2(
+            pdf_bytes, start_page_id, end_page_id
+        )
+        return do_parse_v3(
+            output_dir=temp_dir,
+            pdf_file_names=file_name_list,
+            pdf_bytes_list=[trimmed_bytes],
+            is_image_source_list=is_image_source_list,
+            p_lang_list=lang_list,
+            parse_method=parse_method,
+            start_page_id=start_page_id,
+            end_page_id=end_page_id,
+        )
+
+    raise ValueError(f"Unknown pipeline version: {pipeline_version}")
+
+
+@app.on_event("startup")
+async def configure_thread_pool() -> None:
+    global _thread_pool
+    loop = asyncio.get_running_loop()
+    _thread_pool = concurrent.futures.ThreadPoolExecutor(max_workers=MAX_CONCURRENT_TASKS)
+    loop.set_default_executor(_thread_pool)
+    logger.info(f"MinerU API ready: max_concurrent_tasks={MAX_CONCURRENT_TASKS}")
+
+
+@app.on_event("shutdown")
+async def shutdown_thread_pool() -> None:
+    global _thread_pool
+    if _thread_pool is not None:
+        _thread_pool.shutdown(wait=True, cancel_futures=False)
+        _thread_pool = None
+
+
+@app.get("/health", summary="Service health and concurrency status")
+async def health_check():
+    return {
+        "status": "ok",
+        "max_concurrent_tasks": MAX_CONCURRENT_TASKS,
+        "active_tasks": _active_tasks,
+        "available_slots": _analysis_semaphore._value,
+    }
+
+
+async def _run_analysis(
+    *,
+    file: UploadFile,
+    lang: Optional[str],
+    parse_method: str,
+    start_page_id: int,
+    end_page_id: Optional[int],
+    pipeline_version: str,
+):
+    _validate_extension(file.filename)
+
+    async with _analysis_semaphore:
+        global _active_tasks
+        async with _active_tasks_lock:
+            _active_tasks += 1
+
+        temp_dir = tempfile.mkdtemp()
         temp_file_path = os.path.join(temp_dir, file.filename)
-        with open(temp_file_path, "wb") as f:
-            content = await file.read()
-            f.write(content)
-
         try:
-            # --- Start: Code directly from main.py's parse_doc ---
-            # Use 'read_fn' exactly as in the original code. This function handles
-            # both PDF and image inputs correctly, returning PDF-formatted bytes.
-            logger.info(f"Processing '{temp_file_path}' using read_fn...")
-            pdf_bytes = read_fn(temp_file_path)
-            
-            file_name_list = [Path(file.filename).stem]
-            pdf_bytes_list = [pdf_bytes]
-            lang_list = [lang]
+            with open(temp_file_path, "wb") as f:
+                f.write(await file.read())
 
-            # Call the core processing function, which is a direct copy of do_parse
-            analysis_results = do_parse_in_api(
-                output_dir=temp_dir,
-                pdf_file_names=file_name_list,
-                pdf_bytes_list=pdf_bytes_list,
-                p_lang_list=lang_list,
+            logger.info(
+                f"[{pipeline_version}] queued task started for '{file.filename}' "
+                f"(active={_active_tasks}, max={MAX_CONCURRENT_TASKS})"
+            )
+            pdf_bytes, is_image_source = read_input_file(temp_file_path)
+            resolved_lang = normalize_lang(lang)
+
+            analysis_results = await asyncio.to_thread(
+                _run_analysis_sync,
+                temp_dir=temp_dir,
+                filename=file.filename,
+                pdf_bytes=pdf_bytes,
+                is_image_source=is_image_source,
+                lang=resolved_lang,
                 parse_method=parse_method,
                 start_page_id=start_page_id,
-                end_page_id=end_page_id
+                end_page_id=end_page_id,
+                pipeline_version=pipeline_version,
             )
-            # --- End: Code directly from main.py's parse_doc ---
 
-            # Return the collected results in a single JSON response
             return Response(
-                content=json.dumps({
-                    "filename": file.filename,
-                    "analysis_results": analysis_results
-                }, ensure_ascii=False),
-                media_type="application/json"
+                content=json.dumps(
+                    {
+                        "filename": file.filename,
+                        "pipeline_version": pipeline_version,
+                        "lang": resolved_lang,
+                        "native_resolution_mode": True,
+                        "analysis_results": analysis_results,
+                    },
+                    ensure_ascii=False,
+                ),
+                media_type="application/json",
             )
-            
+        except HTTPException:
+            raise
         except Exception as e:
-            logger.exception(f"An error occurred during MinerU processing for file '{file.filename}': {e}")
-            raise HTTPException(status_code=500, detail=f"Internal server error in MinerU service: {str(e)}")
+            logger.exception(
+                f"[{pipeline_version}] Error during MinerU processing for file '{file.filename}': {e}"
+            )
+            raise HTTPException(
+                status_code=500,
+                detail=f"Internal server error in MinerU service ({pipeline_version}): {str(e)}",
+            )
+        finally:
+            async with _active_tasks_lock:
+                _active_tasks -= 1
+            try:
+                import shutil
+
+                shutil.rmtree(temp_dir, ignore_errors=True)
+            except Exception:
+                pass
+
+
+@app.post(
+    "/analyze_layout/v2",
+    summary="Layout analysis — MinerU 2.0.6-style pipeline (batch doc_analyze)",
+    description=f"{PIPELINE_V2_NOTE} {NATIVE_RESOLUTION_NOTE} {CONCURRENCY_NOTE}",
+)
+async def analyze_document_v2(
+    file: UploadFile = File(..., description=f"Supported types: {sorted(ALLOWED_EXTENSIONS)}"),
+    lang: Optional[str] = Query(
+        None,
+        description=LANG_QUERY_DESCRIPTION,
+    ),
+    parse_method: str = Query("auto", description="Parsing method: 'auto', 'txt', or 'ocr'"),
+    start_page_id: int = Query(0, description="Starting page (0-indexed). Applied before analysis."),
+    end_page_id: Optional[int] = Query(None, description="Ending page (inclusive). None means last page."),
+):
+    return await _run_analysis(
+        file=file,
+        lang=lang,
+        parse_method=parse_method,
+        start_page_id=start_page_id,
+        end_page_id=end_page_id,
+        pipeline_version="v2",
+    )
+
+
+@app.post(
+    "/analyze_layout/v3",
+    summary="Layout analysis — MinerU 3.2.1 streaming pipeline (doc_analyze_streaming)",
+    description=f"{PIPELINE_V3_NOTE} {NATIVE_RESOLUTION_NOTE} {CONCURRENCY_NOTE}",
+)
+async def analyze_document_v3(
+    file: UploadFile = File(..., description=f"Supported types: {sorted(ALLOWED_EXTENSIONS)}"),
+    lang: Optional[str] = Query(
+        None,
+        description=LANG_QUERY_DESCRIPTION,
+    ),
+    parse_method: str = Query("auto", description="Parsing method: 'auto', 'txt', or 'ocr'"),
+    start_page_id: int = Query(0, description="Starting page (0-indexed). Applied before analysis."),
+    end_page_id: Optional[int] = Query(None, description="Ending page (inclusive). None means last page."),
+):
+    return await _run_analysis(
+        file=file,
+        lang=lang,
+        parse_method=parse_method,
+        start_page_id=start_page_id,
+        end_page_id=end_page_id,
+        pipeline_version="v3",
+    )
+
+
+@app.post(
+    "/analyze_layout/",
+    summary="Deprecated — use /analyze_layout/v2",
+    description="Backward-compatible alias for /analyze_layout/v2.",
+    deprecated=True,
+)
+async def analyze_document_legacy(
+    file: UploadFile = File(...),
+    lang: Optional[str] = Query(None, description=LANG_QUERY_DESCRIPTION),
+    parse_method: str = Query("auto"),
+    start_page_id: int = Query(0),
+    end_page_id: Optional[int] = Query(None),
+):
+    return await _run_analysis(
+        file=file,
+        lang=lang,
+        parse_method=parse_method,
+        start_page_id=start_page_id,
+        end_page_id=end_page_id,
+        pipeline_version="v2",
+    )
 
 
 if __name__ == "__main__":

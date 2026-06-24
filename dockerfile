@@ -2,8 +2,8 @@ FROM --platform=linux/arm64 python:3.10-slim-bookworm
 
 LABEL description="MinerU Layout Analysis Service"
 
-ENV PYTHONDONTWRITEBYTECODE 1
-ENV PYTHONUNBUFFERED 1
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libgl1-mesa-glx \
@@ -17,7 +17,7 @@ COPY requirements.txt .
 
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY mineru_service.py .
+COPY mineru_service.py legacy_pipeline.py modern_pipeline.py input_utils.py .
 
 RUN groupadd -r appuser && useradd -r -g appuser appuser
 
