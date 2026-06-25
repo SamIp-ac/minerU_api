@@ -13,6 +13,12 @@ docker run -d \
   --restart unless-stopped \
   samipdocker/mineru-api:latest
 ```
+
+## streamlit demo
+```shell
+streamlit run app.py
+```
+
 ## Note & TODO
 
 ```markdown

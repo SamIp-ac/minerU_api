@@ -1,4 +1,5 @@
 """Streamlit demo for POST /analyze_layout/v3 with bbox overlay preview."""
+# streamlit run app.py
 
 from __future__ import annotations
 
