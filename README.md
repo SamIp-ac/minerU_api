@@ -14,12 +14,14 @@ docker run -d \
   samipdocker/mineru-api:latest
 ```
 
+## Note
+Using for ui demo
 ## streamlit demo
 ```shell
 streamlit run app.py
 ```
 
-## Note & TODO
+## TODO
 
 ```markdown
 要用 keyword 反查 bbox + 類型（table/text 等） → 優先用 analysis_results.content_list_json
