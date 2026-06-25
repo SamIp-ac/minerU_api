@@ -24,7 +24,7 @@ def doc_analyze(
     """
     Drop-in replacement for MinerU 2.0.6 pipeline_analyze.doc_analyze.
 
-    Uses native-resolution page loading instead of MinerU's default 200 DPI path.
+    Uses API page loading (400 DPI, 3500px long-side cap).
     """
     min_batch_inference_size = int(os.environ.get("MINERU_MIN_BATCH_INFERENCE_SIZE", 100))
 

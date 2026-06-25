@@ -5,10 +5,14 @@ Endpoints:
 - `POST /analyze_layout/v2`
 - `POST /analyze_layout/v3`
 - `POST /analyze_layout/` (deprecated alias of v2)
+- `POST /content_lines/v2` — flat type/content/bbox lines only
+- `POST /content_lines/v3` — flat type/content/bbox lines only
 
 Both routes return the **same top-level JSON envelope**.  
 Only `pipeline_version` and `analysis_results.pipeline` differ.  
 Nested field values (`middle_json`, coordinates, markdown text) are **not guaranteed identical** between v2 and v3.
+
+This API pins **`mineru[core]==3.2.1`** (see `requirements.txt`) but overrides MinerU’s default **200 DPI** render path with **400 DPI** in `input_utils.py`.
 
 ---
 
@@ -19,8 +23,26 @@ Nested field values (`middle_json`, coordinates, markdown text) are **not guaran
 | `filename` | `string` | Original uploaded filename |
 | `pipeline_version` | `"v2"` \| `"v3"` | Which pipeline handled the request |
 | `lang` | `string` \| `null` | Resolved OCR language hint (`null` = multilingual/default OCR path) |
-| `native_resolution_mode` | `boolean` | Always `true` in current API (no 200 DPI / 3500px downscale in our layer) |
+| `preprocessing_mode` | `"custom"` | API overrides MinerU 3.2.1 default (200 DPI) |
+| `preprocessing` | `object` | Effective render settings for this request (see below) |
 | `analysis_results` | `object` | Parsed layout output (see below) |
+
+### `preprocessing` object
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `dpi` | `integer` | PDF/image page render DPI. **400** (API override; MinerU default is 200) |
+| `max_side` | `integer` | Long-side pixel cap passed to `page_to_image`. **3500** |
+| `image_to_pdf` | `string` | Image upload path. **`images_bytes_to_pdf_bytes_at_dpi`** (EXIF transpose, RGB, PDF save at 400 DPI, quality=95) |
+
+Applies to both v2 and v3:
+
+| Step | Setting (this API) | MinerU 3.2.1 default |
+|------|-------------------|----------------------|
+| PDF render DPI | **400** | 200 |
+| Long-side cap | **3500 px** | 3500 px |
+| Image → PDF | **400 DPI save** | 200 DPI save |
+| Image page render DPI | **400** | 200 |
 
 ---
 
@@ -130,6 +152,70 @@ Other fields may appear depending on `type` (`table_body`, `code_body`, `sub_typ
 
 ---
 
+## Flat content lines (`POST /content_lines/v2` and `/content_lines/v3`)
+
+Lightweight response for keyword → bbox lookup. No full `middle_json` / `markdown`.
+
+### Top-level response
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `filename` | `string` | Original uploaded filename |
+| `pipeline_version` | `"v2"` \| `"v3"` | Pipeline used |
+| `lang` | `string` \| `null` | OCR language hint |
+| `item_count` | `integer` | Number of lines in `items` |
+| `items` | `array` | Flat content lines (see below) |
+
+Query parameter **`include_discarded`** (default `true`): append span text from `discarded_blocks` (headers, margins, footers).
+
+### `items[]` (each line)
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `line_index` | `integer` | 0-based index in reading order |
+| `type` | `string` | `text`, `title`, `image`, `table`, `equation`, `header`, `footer`, … |
+| `content` | `string` \| `null` | Text, table HTML, image path, etc. |
+| `bbox` | `[int,int,int,int]` \| `null` | Box coordinates (often 0–1000 normalized scale) |
+| `page_idx` | `integer` | Source page, 0-based |
+| `source` | `string` | Present when from `discarded_blocks` (`"discarded"`) |
+
+### Example
+
+```json
+{
+  "filename": "form.pdf",
+  "pipeline_version": "v2",
+  "lang": "en",
+  "item_count": 3,
+  "items": [
+    {
+      "line_index": 0,
+      "type": "header",
+      "content": "Sex: F",
+      "bbox": [620, 45, 710, 62],
+      "page_idx": 0,
+      "source": "discarded"
+    },
+    {
+      "line_index": 1,
+      "type": "text",
+      "content": "Chief complaint",
+      "bbox": [85, 120, 320, 140],
+      "page_idx": 0
+    },
+    {
+      "line_index": 2,
+      "type": "table",
+      "content": "<table>...</table>",
+      "bbox": [50, 200, 550, 400],
+      "page_idx": 0
+    }
+  ]
+}
+```
+
+---
+
 ## `markdown`
 
 `string` — full document as Markdown with embedded image references, tables as HTML, and formulas as LaTeX where detected.
@@ -143,7 +229,12 @@ Other fields may appear depending on `type` (`table_body`, `code_body`, `sub_typ
   "filename": "document.pdf",
   "pipeline_version": "v2",
   "lang": null,
-  "native_resolution_mode": true,
+  "preprocessing_mode": "custom",
+  "preprocessing": {
+    "dpi": 400,
+    "max_side": 3500,
+    "image_to_pdf": "images_bytes_to_pdf_bytes_at_dpi"
+  },
   "analysis_results": {
     "middle_json": {
       "pdf_info": [
@@ -190,8 +281,8 @@ Other fields may appear depending on `type` (`table_body`, `code_body`, `sub_typ
         ],
         "page_info": {
           "page_no": 0,
-          "width": 2550,
-          "height": 3300
+          "width": 3400,
+          "height": 4400
         }
       }
     ],
@@ -208,8 +299,8 @@ Other fields may appear depending on `type` (`table_body`, `code_body`, `sub_typ
     "rendered_pages": [
       {
         "page_index": 0,
-        "width": 2550,
-        "height": 3300
+        "width": 3400,
+        "height": 4400
       }
     ]
   }
@@ -227,7 +318,12 @@ Same envelope and `analysis_results` keys. Only identifiers change:
   "filename": "document.pdf",
   "pipeline_version": "v3",
   "lang": null,
-  "native_resolution_mode": true,
+  "preprocessing_mode": "custom",
+  "preprocessing": {
+    "dpi": 400,
+    "max_side": 3500,
+    "image_to_pdf": "images_bytes_to_pdf_bytes_at_dpi"
+  },
   "analysis_results": {
     "middle_json": { "... same schema as v2; values may differ ..." },
     "model_json": [ "... same schema as v2; values may differ ..." ],
@@ -237,8 +333,8 @@ Same envelope and `analysis_results` keys. Only identifiers change:
     "rendered_pages": [
       {
         "page_index": 0,
-        "width": 2550,
-        "height": 3300
+        "width": 3400,
+        "height": 4400
       }
     ]
   }
@@ -271,7 +367,7 @@ Common `detail` cases:
 1. Prefer **`content_list_json`** for structured per-block consumption.
 2. Prefer **`markdown`** for human-readable or LLM text input.
 3. Prefer **`middle_json`** when you need full layout tree, spans, and coordinates.
-4. Use **`rendered_pages`** to verify input resolution after native-resolution loading.
+4. Use **`preprocessing`** and **`rendered_pages`** to verify render settings and output page size (long side should be ≤ `preprocessing.max_side`, typically 3500).
 5. Compare v2 vs v3 on the same file by diffing `markdown` or `content_list_json`, not only `pipeline`.
 
 ---
@@ -280,3 +376,5 @@ Common `detail` cases:
 
 MinerU official middle.json / content_list docs:  
 https://opendatalab.github.io/MinerU/reference/output_files/
+
+Render settings are defined in this repo’s `input_utils.py` (`PDF_RENDER_DPI = 400`, `MAX_RENDER_SIDE = 3500`). MinerU 3.2.1 library defaults remain 200 DPI — see `mineru/utils/pdf_image_tools.py` and `mineru/utils/pdf_reader.py` on the `mineru-3.2.1-released` tag.

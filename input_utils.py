@@ -1,4 +1,4 @@
-"""Input loading helpers that avoid MinerU's default 200 DPI / 3500px downscaling."""
+"""Input loading helpers with API-level render DPI override."""
 
 from __future__ import annotations
 
@@ -21,9 +21,8 @@ IMAGE_SUFFIXES = {".png", ".jpeg", ".jpg"}
 PDF_SUFFIXES = {".pdf"}
 ALLOWED_SUFFIXES = IMAGE_SUFFIXES | PDF_SUFFIXES
 
-NATIVE_MAX_SIDE = 99999
-PDF_RENDER_DPI = 300
-IMAGE_WRAPPED_PDF_DPI = 72
+PDF_RENDER_DPI = 400
+MAX_RENDER_SIDE = 3500
 
 _render_dpi: ContextVar[Optional[int]] = ContextVar("mineru_render_dpi", default=None)
 _render_max_side: ContextVar[Optional[int]] = ContextVar("mineru_render_max_side", default=None)
@@ -39,7 +38,7 @@ def _install_thread_safe_page_renderer() -> None:
 
     _original_page_to_image = pdf_reader.page_to_image
 
-    def thread_safe_page_to_image(page, dpi=200, max_width_or_height=3500):
+    def thread_safe_page_to_image(page, dpi=PDF_RENDER_DPI, max_width_or_height=MAX_RENDER_SIDE):
         use_dpi = _render_dpi.get()
         use_max = _render_max_side.get()
         if use_dpi is None:
@@ -54,15 +53,21 @@ def _install_thread_safe_page_renderer() -> None:
 _install_thread_safe_page_renderer()
 
 
-def image_bytes_to_pdf_bytes_native(image_bytes: bytes) -> bytes:
-    """Wrap a raster image in PDF bytes without MinerU's 200 DPI save step."""
+def images_bytes_to_pdf_bytes_at_dpi(image_bytes: bytes, dpi: int = PDF_RENDER_DPI) -> bytes:
+    """Same steps as MinerU images_bytes_to_pdf_bytes, with a configurable PDF save DPI."""
     image = Image.open(BytesIO(image_bytes))
     image = ImageOps.exif_transpose(image) or image
     if image.mode != "RGB":
         image = image.convert("RGB")
 
     pdf_buffer = BytesIO()
-    image.save(pdf_buffer, format="PDF")
+    image.save(
+        pdf_buffer,
+        format="PDF",
+        resolution=dpi,
+        quality=95,
+        subsampling=0,
+    )
     return pdf_buffer.getvalue()
 
 
@@ -72,15 +77,17 @@ def read_input_file(path: str | Path) -> tuple[bytes, bool]:
     raw_bytes = file_path.read_bytes()
 
     if suffix in IMAGE_SUFFIXES:
-        return image_bytes_to_pdf_bytes_native(raw_bytes), True
+        return images_bytes_to_pdf_bytes_at_dpi(raw_bytes), True
     if suffix in PDF_SUFFIXES:
         return raw_bytes, False
     raise ValueError(f"Unsupported file suffix: {suffix}")
 
 
-def render_pdf_page_native(page, *, is_image_source: bool):
-    dpi = IMAGE_WRAPPED_PDF_DPI if is_image_source else PDF_RENDER_DPI
-    return _original_page_to_image(page, dpi=dpi, max_width_or_height=NATIVE_MAX_SIDE)
+def render_pdf_page(page, *, is_image_source: bool):
+    del is_image_source
+    return _original_page_to_image(
+        page, dpi=PDF_RENDER_DPI, max_width_or_height=MAX_RENDER_SIDE
+    )
 
 
 def load_pages_native(
@@ -100,20 +107,25 @@ def load_pages_native(
     with pdfium_guard():
         for page_index in range(start_page_id, end_page_id + 1):
             page = pdf_doc[page_index]
-            pil_img, scale = render_pdf_page_native(page, is_image_source=is_image_source)
+            pil_img, scale = render_pdf_page(page, is_image_source=is_image_source)
             native_images.append({"img_pil": pil_img, "scale": scale})
 
     return native_images, pdf_doc
 
 
 @contextmanager
-def native_resolution_mode(is_image_source: bool = False):
-    """Per-request render settings safe for parallel worker threads."""
-    render_dpi = IMAGE_WRAPPED_PDF_DPI if is_image_source else PDF_RENDER_DPI
-    token_dpi = _render_dpi.set(render_dpi)
-    token_max = _render_max_side.set(NATIVE_MAX_SIDE)
+def api_render_mode(is_image_source: bool = False):
+    """Per-request render settings (PDF_RENDER_DPI / MAX_RENDER_SIDE); safe for parallel threads."""
+    del is_image_source
+    token_dpi = _render_dpi.set(PDF_RENDER_DPI)
+    token_max = _render_max_side.set(MAX_RENDER_SIDE)
     try:
         yield
     finally:
         _render_dpi.reset(token_dpi)
         _render_max_side.reset(token_max)
+
+
+# Backward-compatible aliases for v3 pipeline import
+official_render_mode = api_render_mode
+native_resolution_mode = api_render_mode

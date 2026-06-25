@@ -18,18 +18,19 @@ from mineru.cli.common import convert_pdf_bytes_to_bytes, prepare_env
 from mineru.data.data_reader_writer import FileBasedDataWriter
 from mineru.utils.enum_class import MakeMode
 
-from input_utils import ALLOWED_SUFFIXES, PDF_RENDER_DPI, IMAGE_WRAPPED_PDF_DPI, NATIVE_MAX_SIDE, read_input_file
+from input_utils import ALLOWED_SUFFIXES, MAX_RENDER_SIDE, PDF_RENDER_DPI, read_input_file
+from flat_output import build_content_lines
 from legacy_pipeline import doc_analyze as pipeline_doc_analyze_v2
 from modern_pipeline import do_parse_v3
 
 convert_pdf_bytes_to_bytes_by_pypdfium2 = convert_pdf_bytes_to_bytes
 
-NATIVE_RESOLUTION_NOTE = (
-    "Native-resolution mode is enabled for both v2 and v3 routes. "
-    "Image uploads (png/jpg/jpeg) are wrapped into PDF without MinerU's 200 DPI save step, "
-    f"then rendered at {IMAGE_WRAPPED_PDF_DPI} DPI with no 3500px long-side cap. "
-    f"PDF uploads render at {PDF_RENDER_DPI} DPI with no 3500px cap (default MinerU cap bypassed via max_side={NATIVE_MAX_SIDE}). "
-    "Internal ML models may still resize tensors during inference."
+PREPROCESSING_NOTE = (
+    "API render DPI override is enabled for both v2 and v3 routes. "
+    f"Image uploads are wrapped to PDF at {PDF_RENDER_DPI} DPI "
+    "(EXIF transpose, RGB, quality=95). "
+    f"All pages render at {PDF_RENDER_DPI} DPI with a {MAX_RENDER_SIDE}px long-side cap. "
+    "MinerU 3.2.1 default is 200 DPI; internal ML models may still resize tensors during inference."
 )
 
 PIPELINE_V2_NOTE = (
@@ -66,7 +67,7 @@ app = FastAPI(
     title="MinerU Document Analysis Service",
     description=(
         "Layout analysis API with two pipeline versions for comparison. "
-        + NATIVE_RESOLUTION_NOTE
+        + PREPROCESSING_NOTE
         + " "
         + CONCURRENCY_NOTE
     ),
@@ -236,7 +237,7 @@ async def health_check():
     }
 
 
-async def _run_analysis(
+async def _execute_analysis(
     *,
     file: UploadFile,
     lang: Optional[str],
@@ -244,7 +245,7 @@ async def _run_analysis(
     start_page_id: int,
     end_page_id: Optional[int],
     pipeline_version: str,
-):
+) -> tuple[str, Optional[str], dict]:
     _validate_extension(file.filename)
 
     async with _analysis_semaphore:
@@ -278,19 +279,7 @@ async def _run_analysis(
                 pipeline_version=pipeline_version,
             )
 
-            return Response(
-                content=json.dumps(
-                    {
-                        "filename": file.filename,
-                        "pipeline_version": pipeline_version,
-                        "lang": resolved_lang,
-                        "native_resolution_mode": True,
-                        "analysis_results": analysis_results,
-                    },
-                    ensure_ascii=False,
-                ),
-                media_type="application/json",
-            )
+            return file.filename, resolved_lang, analysis_results
         except HTTPException:
             raise
         except Exception as e:
@@ -312,10 +301,145 @@ async def _run_analysis(
                 pass
 
 
+async def _run_analysis(
+    *,
+    file: UploadFile,
+    lang: Optional[str],
+    parse_method: str,
+    start_page_id: int,
+    end_page_id: Optional[int],
+    pipeline_version: str,
+):
+    filename, resolved_lang, analysis_results = await _execute_analysis(
+        file=file,
+        lang=lang,
+        parse_method=parse_method,
+        start_page_id=start_page_id,
+        end_page_id=end_page_id,
+        pipeline_version=pipeline_version,
+    )
+
+    return Response(
+        content=json.dumps(
+            {
+                "filename": filename,
+                "pipeline_version": pipeline_version,
+                "lang": resolved_lang,
+                "preprocessing_mode": "custom",
+                "preprocessing": {
+                    "dpi": PDF_RENDER_DPI,
+                    "max_side": MAX_RENDER_SIDE,
+                    "image_to_pdf": "images_bytes_to_pdf_bytes_at_dpi",
+                },
+                "analysis_results": analysis_results,
+            },
+            ensure_ascii=False,
+        ),
+        media_type="application/json",
+    )
+
+
+async def _run_content_lines(
+    *,
+    file: UploadFile,
+    lang: Optional[str],
+    parse_method: str,
+    start_page_id: int,
+    end_page_id: Optional[int],
+    pipeline_version: str,
+    include_discarded: bool,
+):
+    filename, resolved_lang, analysis_results = await _execute_analysis(
+        file=file,
+        lang=lang,
+        parse_method=parse_method,
+        start_page_id=start_page_id,
+        end_page_id=end_page_id,
+        pipeline_version=pipeline_version,
+    )
+
+    items = build_content_lines(analysis_results, include_discarded=include_discarded)
+
+    return Response(
+        content=json.dumps(
+            {
+                "filename": filename,
+                "pipeline_version": pipeline_version,
+                "lang": resolved_lang,
+                "item_count": len(items),
+                "items": items,
+            },
+            ensure_ascii=False,
+        ),
+        media_type="application/json",
+    )
+
+
+CONTENT_LINES_NOTE = (
+    "Returns a flat JSON array of content lines: each item has type, content, bbox, and page_idx. "
+    "By default also includes text from discarded_blocks (headers/margins) so form fields like "
+    "'Sex: F' are not lost. Set include_discarded=false to match content_list_json only."
+)
+
+
+@app.post(
+    "/content_lines/v2",
+    summary="Flat content lines — type, content, bbox (v2 pipeline)",
+    description=f"{PIPELINE_V2_NOTE} {CONTENT_LINES_NOTE} {CONCURRENCY_NOTE}",
+)
+async def content_lines_v2(
+    file: UploadFile = File(..., description=f"Supported types: {sorted(ALLOWED_EXTENSIONS)}"),
+    lang: Optional[str] = Query(None, description=LANG_QUERY_DESCRIPTION),
+    parse_method: str = Query("auto", description="Parsing method: 'auto', 'txt', or 'ocr'"),
+    start_page_id: int = Query(0, description="Starting page (0-indexed). Applied before analysis."),
+    end_page_id: Optional[int] = Query(None, description="Ending page (inclusive). None means last page."),
+    include_discarded: bool = Query(
+        True,
+        description="Include text from discarded_blocks (headers, footers, margin fields).",
+    ),
+):
+    return await _run_content_lines(
+        file=file,
+        lang=lang,
+        parse_method=parse_method,
+        start_page_id=start_page_id,
+        end_page_id=end_page_id,
+        pipeline_version="v2",
+        include_discarded=include_discarded,
+    )
+
+
+@app.post(
+    "/content_lines/v3",
+    summary="Flat content lines — type, content, bbox (v3 pipeline)",
+    description=f"{PIPELINE_V3_NOTE} {CONTENT_LINES_NOTE} {CONCURRENCY_NOTE}",
+)
+async def content_lines_v3(
+    file: UploadFile = File(..., description=f"Supported types: {sorted(ALLOWED_EXTENSIONS)}"),
+    lang: Optional[str] = Query(None, description=LANG_QUERY_DESCRIPTION),
+    parse_method: str = Query("auto", description="Parsing method: 'auto', 'txt', or 'ocr'"),
+    start_page_id: int = Query(0, description="Starting page (0-indexed). Applied before analysis."),
+    end_page_id: Optional[int] = Query(None, description="Ending page (inclusive). None means last page."),
+    include_discarded: bool = Query(
+        True,
+        description="Include text from discarded_blocks (headers, footers, margin fields).",
+    ),
+):
+    return await _run_content_lines(
+        file=file,
+        lang=lang,
+        parse_method=parse_method,
+        start_page_id=start_page_id,
+        end_page_id=end_page_id,
+        pipeline_version="v3",
+        include_discarded=include_discarded,
+    )
+
+
 @app.post(
     "/analyze_layout/v2",
     summary="Layout analysis — MinerU 2.0.6-style pipeline (batch doc_analyze)",
-    description=f"{PIPELINE_V2_NOTE} {NATIVE_RESOLUTION_NOTE} {CONCURRENCY_NOTE}",
+    description=f"{PIPELINE_V2_NOTE} {PREPROCESSING_NOTE} {CONCURRENCY_NOTE}",
 )
 async def analyze_document_v2(
     file: UploadFile = File(..., description=f"Supported types: {sorted(ALLOWED_EXTENSIONS)}"),
@@ -340,7 +464,7 @@ async def analyze_document_v2(
 @app.post(
     "/analyze_layout/v3",
     summary="Layout analysis — MinerU 3.2.1 streaming pipeline (doc_analyze_streaming)",
-    description=f"{PIPELINE_V3_NOTE} {NATIVE_RESOLUTION_NOTE} {CONCURRENCY_NOTE}",
+    description=f"{PIPELINE_V3_NOTE} {PREPROCESSING_NOTE} {CONCURRENCY_NOTE}",
 )
 async def analyze_document_v3(
     file: UploadFile = File(..., description=f"Supported types: {sorted(ALLOWED_EXTENSIONS)}"),

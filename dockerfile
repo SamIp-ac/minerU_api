@@ -17,7 +17,7 @@ COPY requirements.txt .
 
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY mineru_service.py legacy_pipeline.py modern_pipeline.py input_utils.py .
+COPY mineru_service.py legacy_pipeline.py modern_pipeline.py input_utils.py flat_output.py .
 
 RUN groupadd -r appuser && useradd -r -g appuser appuser
 

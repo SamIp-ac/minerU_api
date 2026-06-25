@@ -29,7 +29,7 @@ def do_parse_v3(
     p_table_enable: bool = True,
     f_make_md_mode: MakeMode = MakeMode.MM_MD,
 ):
-    """MinerU 3.2.x path: doc_analyze_streaming with native-resolution rendering."""
+    """MinerU 3.2.x path: doc_analyze_streaming with API render settings (400 DPI)."""
     from input_utils import load_pages_native
 
     if start_page_id != 0 or end_page_id is not None:
